@@ -22,7 +22,7 @@ fi
 if command -v shellcheck >/dev/null 2>&1; then
   printf '%s\n' "== shellcheck =="
   shellcheck -s sh -e SC1090,SC2329 $scripts
-  shellcheck -s sh -e SC1091,SC2034,SC2329 scripts/test-installer-download.sh
+  shellcheck -s sh -e SC1091,SC2034,SC2329 scripts/test-installer-download.sh scripts/test-bandwidth-occupier.sh
 fi
 
 printf '%s\n' "== runtime check commands =="
@@ -34,6 +34,9 @@ sh oalive.sh --status >/dev/null
 
 printf '%s\n' "== remote installer download regression =="
 sh scripts/test-installer-download.sh
+
+printf '%s\n' "== bandwidth source and timeout regression =="
+sh scripts/test-bandwidth-occupier.sh
 
 printf '%s\n' "== source reference check =="
 legacy_source_host=$(printf '%s%s' 'git' 'lab.com')

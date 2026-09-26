@@ -32,9 +32,18 @@ BANDWIDTH_RATE_PERCENT=${BANDWIDTH_RATE_PERCENT:-30}
 BANDWIDTH_RATE_MBPS=${BANDWIDTH_RATE_MBPS:-auto}
 BANDWIDTH_DEFAULT_MBPS=${BANDWIDTH_DEFAULT_MBPS:-10}
 BANDWIDTH_SPEEDTEST_COUNT=${BANDWIDTH_SPEEDTEST_COUNT:-10}
-BANDWIDTH_URL_CHECKS=${BANDWIDTH_URL_CHECKS:-3}
 BANDWIDTH_URL=${BANDWIDTH_URL:-}
+BANDWIDTH_URLS=${BANDWIDTH_URLS:-}
+BANDWIDTH_URL_FILE=${BANDWIDTH_URL_FILE:-}
+BANDWIDTH_URL_CHECKS=${BANDWIDTH_URL_CHECKS:-0}
+BANDWIDTH_PROBE_TIMEOUT=${BANDWIDTH_PROBE_TIMEOUT:-5}
+BANDWIDTH_PROBE_RATE=${BANDWIDTH_PROBE_RATE:-16384}
 SPEEDTEST_GO_BIN=${SPEEDTEST_GO_BIN:-/etc/speedtest-cli/speedtest-go}
+RUN_PID=
+TIMER_PID=
+TIMEOUT_FILE=
+RUN_TIMED_OUT=0
+BANDWIDTH_SKIP_URLS=
 
 is_uint() {
   case ${1:-} in
@@ -43,12 +52,25 @@ is_uint() {
   esac
 }
 
+canonical_uint() {
+  value=$1
+  value=$(printf '%s\n' "$value" | sed 's/^0*//')
+  [ -n "$value" ] || value=0
+  printf '%s\n' "$value"
+}
+
 is_number() {
   awk -v n="${1:-}" 'BEGIN {exit (n ~ /^[0-9]+([.][0-9]+)?$/ ? 0 : 1)}'
 }
 
 now() {
   date '+%Y-%m-%d %H:%M:%S' 2>/dev/null || date
+}
+
+epoch_seconds() {
+  value=$(date '+%s' 2>/dev/null || true)
+  is_uint "$value" || return 1
+  printf '%s\n' "$value"
 }
 
 ensure_log_dir() {
@@ -107,6 +129,7 @@ cleanup() {
   trap - INT TERM EXIT
   [ -n "${RUN_PID:-}" ] && kill "$RUN_PID" 2>/dev/null || true
   [ -n "${TIMER_PID:-}" ] && kill "$TIMER_PID" 2>/dev/null || true
+  [ -n "${TIMEOUT_FILE:-}" ] && rm -f "$TIMEOUT_FILE" 2>/dev/null || true
   rm -rf "$LOCK_DIR" 2>/dev/null || true
 }
 
@@ -120,7 +143,9 @@ normalize_settings() {
   is_uint "$BANDWIDTH_INTERVAL_MINUTES" || BANDWIDTH_INTERVAL_MINUTES=45
   is_uint "$BANDWIDTH_RATE_PERCENT" || BANDWIDTH_RATE_PERCENT=30
   is_uint "$BANDWIDTH_SPEEDTEST_COUNT" || BANDWIDTH_SPEEDTEST_COUNT=10
-  is_uint "$BANDWIDTH_URL_CHECKS" || BANDWIDTH_URL_CHECKS=3
+  is_uint "$BANDWIDTH_URL_CHECKS" || BANDWIDTH_URL_CHECKS=0
+  is_uint "$BANDWIDTH_PROBE_TIMEOUT" || BANDWIDTH_PROBE_TIMEOUT=5
+  is_uint "$BANDWIDTH_PROBE_RATE" || BANDWIDTH_PROBE_RATE=16384
   is_number "$BANDWIDTH_DEFAULT_MBPS" || BANDWIDTH_DEFAULT_MBPS=10
   [ "$BANDWIDTH_DURATION_MINUTES" -ge 1 ] || BANDWIDTH_DURATION_MINUTES=6
   [ "$BANDWIDTH_DURATION_MINUTES" -le 1440 ] || BANDWIDTH_DURATION_MINUTES=1440
@@ -129,8 +154,18 @@ normalize_settings() {
   [ "$BANDWIDTH_RATE_PERCENT" -le 100 ] || BANDWIDTH_RATE_PERCENT=100
   [ "$BANDWIDTH_SPEEDTEST_COUNT" -ge 1 ] || BANDWIDTH_SPEEDTEST_COUNT=10
   [ "$BANDWIDTH_SPEEDTEST_COUNT" -le 100 ] || BANDWIDTH_SPEEDTEST_COUNT=100
-  [ "$BANDWIDTH_URL_CHECKS" -ge 1 ] || BANDWIDTH_URL_CHECKS=3
-  [ "$BANDWIDTH_URL_CHECKS" -le 10 ] || BANDWIDTH_URL_CHECKS=10
+  [ "$BANDWIDTH_URL_CHECKS" -le 100 ] || BANDWIDTH_URL_CHECKS=0
+  [ "$BANDWIDTH_PROBE_TIMEOUT" -ge 1 ] || BANDWIDTH_PROBE_TIMEOUT=5
+  [ "$BANDWIDTH_PROBE_TIMEOUT" -le 60 ] || BANDWIDTH_PROBE_TIMEOUT=60
+  [ "$BANDWIDTH_PROBE_RATE" -ge 1024 ] || BANDWIDTH_PROBE_RATE=16384
+  [ "$BANDWIDTH_PROBE_RATE" -le 1048576 ] || BANDWIDTH_PROBE_RATE=1048576
+  BANDWIDTH_DURATION_MINUTES=$(canonical_uint "$BANDWIDTH_DURATION_MINUTES")
+  BANDWIDTH_INTERVAL_MINUTES=$(canonical_uint "$BANDWIDTH_INTERVAL_MINUTES")
+  BANDWIDTH_RATE_PERCENT=$(canonical_uint "$BANDWIDTH_RATE_PERCENT")
+  BANDWIDTH_SPEEDTEST_COUNT=$(canonical_uint "$BANDWIDTH_SPEEDTEST_COUNT")
+  BANDWIDTH_URL_CHECKS=$(canonical_uint "$BANDWIDTH_URL_CHECKS")
+  BANDWIDTH_PROBE_TIMEOUT=$(canonical_uint "$BANDWIDTH_PROBE_TIMEOUT")
+  BANDWIDTH_PROBE_RATE=$(canonical_uint "$BANDWIDTH_PROBE_RATE")
   case "$BANDWIDTH_MODE" in
     speedtest|speedtest-go|speedtest_go) BANDWIDTH_MODE=speedtest ;;
     *) BANDWIDTH_MODE=wget ;;
@@ -138,17 +173,38 @@ normalize_settings() {
 }
 
 download_urls() {
+  if [ -n "$BANDWIDTH_URL" ]; then
+    printf '%s\n' "$BANDWIDTH_URL"
+    return 0
+  fi
+
+  if [ -n "$BANDWIDTH_URL_FILE" ] && [ -r "$BANDWIDTH_URL_FILE" ]; then
+    awk 'NF && $1 !~ /^#/ {print $1}' "$BANDWIDTH_URL_FILE"
+    return 0
+  fi
+
+  if [ -n "$BANDWIDTH_URLS" ]; then
+    printf '%s\n' "$BANDWIDTH_URLS" | awk '
+      {
+        count = split($0, parts, /[[:space:],]+/)
+        for (i = 1; i <= count; i++) {
+          if (parts[i] != "" && parts[i] !~ /^#/) print parts[i]
+        }
+      }
+    '
+    return 0
+  fi
+
+  # Ordinary static test files are less fragile than special download APIs.
   cat <<'URLS'
-https://speed.cloudflare.com/__down?bytes=1000000000
-http://mirror.nl.leaseweb.net/speedtest/1000mb.bin
-http://mirror.dal10.us.leaseweb.net/speedtest/1000mb.bin
-http://mirror.hk.leaseweb.net/speedtest/1000mb.bin
-http://mirror.sfo12.us.leaseweb.net/speedtest/1000mb.bin
-http://mirror.de.leaseweb.net/speedtest/1000mb.bin
-http://mirror.syd10.au.leaseweb.net/speedtest/1000mb.bin
-https://speed.hetzner.de/1GB.bin
-http://proof.ovh.net/files/1Gio.dat
-http://speedtest.tele2.net/1GB.zip
+https://speedtest.tele2.net/1GB.zip
+https://ash-speed.hetzner.com/100MB.bin
+https://cachefly.cachefly.net/100mb.test
+https://speedtest.london.linode.com/100MB-london.bin
+https://speedtest.atlanta.linode.com/100MB-atlanta.bin
+https://speedtest.frankfurt.linode.com/100MB-frankfurt.bin
+https://speedtest.selectel.ru/100MB
+https://proof.ovh.net/files/100Mb.dat
 URLS
 }
 
@@ -158,39 +214,84 @@ url_count() {
 
 probe_url() {
   url=$1
+  [ -n "$url" ] || return 1
+
   if command -v curl >/dev/null 2>&1; then
-    curl -fsIL --connect-timeout 3 --max-time 5 "$url" >/dev/null 2>&1
+    probe_result=$(curl -fsSL --range 0-1023 \
+      --connect-timeout "$BANDWIDTH_PROBE_TIMEOUT" \
+      --limit-rate "$BANDWIDTH_PROBE_RATE" \
+      --max-time "$BANDWIDTH_PROBE_TIMEOUT" \
+      -o /dev/null -w '%{size_download}' "$url" 2>/dev/null) || true
+    is_uint "$probe_result" || return 1
+    [ "$probe_result" -gt 0 ]
     return $?
   fi
+
   if command -v wget >/dev/null 2>&1; then
-    wget --spider --timeout=5 --tries=1 "$url" >/dev/null 2>&1
+    probe_file=$RUN_DIR/oalive-bandwidth-probe.$$
+    rm -f "$probe_file" 2>/dev/null || true
+    run_with_timeout "$BANDWIDTH_PROBE_TIMEOUT" wget -q \
+      --timeout="$BANDWIDTH_PROBE_TIMEOUT" --tries=1 \
+      --limit-rate="$BANDWIDTH_PROBE_RATE" \
+      --header='Range: bytes=0-1023' -O "$probe_file" "$url" \
+      >/dev/null 2>&1
+    probe_size=$(wc -c <"$probe_file" 2>/dev/null || echo 0)
+    rm -f "$probe_file" 2>/dev/null || true
+    is_uint "$probe_size" || probe_size=0
+    [ "$probe_size" -gt 0 ]
     return $?
   fi
+
   if command -v fetch >/dev/null 2>&1; then
-    fetch -q -o /dev/null -T 5 "$url" >/dev/null 2>&1
+    probe_file=$RUN_DIR/oalive-bandwidth-probe.$$
+    rm -f "$probe_file" 2>/dev/null || true
+    run_with_timeout "$BANDWIDTH_PROBE_TIMEOUT" fetch -q -o "$probe_file" -T "$BANDWIDTH_PROBE_TIMEOUT" "$url" \
+      >/dev/null 2>&1
+    probe_size=$(wc -c <"$probe_file" 2>/dev/null || echo 0)
+    rm -f "$probe_file" 2>/dev/null || true
+    is_uint "$probe_size" || probe_size=0
+    [ "$probe_size" -gt 0 ]
     return $?
   fi
   return 1
 }
 
-select_url() {
-  if [ -n "$BANDWIDTH_URL" ]; then
-    printf '%s\n' "$BANDWIDTH_URL"
-    return 0
-  fi
+url_at() {
+  index=$1
+  download_urls | awk -v n="$index" 'NR == n {print; exit}'
+}
 
+url_is_skipped() {
+  [ -n "$BANDWIDTH_SKIP_URLS" ] || return 1
+  printf '%s\n' "$BANDWIDTH_SKIP_URLS" | grep -Fqx "$1"
+}
+
+skip_url() {
+  if [ -n "$BANDWIDTH_SKIP_URLS" ]; then
+    BANDWIDTH_SKIP_URLS="$BANDWIDTH_SKIP_URLS
+$1"
+  else
+    BANDWIDTH_SKIP_URLS=$1
+  fi
+}
+
+select_url() {
   count=$(url_count)
-  is_uint "$count" || count=1
+  is_uint "$count" || count=0
+  [ "$count" -gt 0 ] || return 1
+
+  checks=$BANDWIDTH_URL_CHECKS
+  [ "$checks" -gt 0 ] && [ "$checks" -lt "$count" ] || checks=$count
   minute=$(date '+%M' 2>/dev/null || echo 0)
   is_uint "$minute" || minute=0
+  minute=$(canonical_uint "$minute")
   start=$((minute % count + 1))
   checked=0
   index=$start
 
-  while [ "$checked" -lt "$BANDWIDTH_URL_CHECKS" ]; do
-    url=$(download_urls | awk -v n="$index" 'NR == n {print; exit}')
-    [ -n "$url" ] || url=$(download_urls | awk 'NR == 1 {print; exit}')
-    if probe_url "$url"; then
+  while [ "$checked" -lt "$checks" ]; do
+    url=$(url_at "$index")
+    if [ -n "$url" ] && ! url_is_skipped "$url" && probe_url "$url"; then
       printf '%s\n' "$url"
       return 0
     fi
@@ -199,7 +300,7 @@ select_url() {
     [ "$index" -le "$count" ] || index=1
   done
 
-  printf '%s\n' 'https://speed.cloudflare.com/__down?bytes=1000000000'
+  return 1
 }
 
 speedtest_bin() {
@@ -266,19 +367,34 @@ rate_bytes_per_second() {
 run_with_timeout() {
   seconds=$1
   shift
+  is_uint "$seconds" || seconds=1
+  [ "$seconds" -ge 1 ] || seconds=1
+  TIMEOUT_FILE=$RUN_DIR/oalive-bandwidth-timeout.$$
+  rm -f "$TIMEOUT_FILE" 2>/dev/null || true
+  RUN_TIMED_OUT=0
   "$@" &
   RUN_PID=$!
   (
+    trap - EXIT HUP INT TERM
     sleep "$seconds"
-    kill "$RUN_PID" 2>/dev/null || true
+    if kill -0 "$RUN_PID" 2>/dev/null; then
+      : >"$TIMEOUT_FILE" 2>/dev/null || true
+      kill "$RUN_PID" 2>/dev/null || true
+    fi
   ) &
   TIMER_PID=$!
-  wait "$RUN_PID" 2>/dev/null
-  rc=$?
+  rc=0
+  wait "$RUN_PID" 2>/dev/null || rc=$?
   kill "$TIMER_PID" 2>/dev/null || true
   wait "$TIMER_PID" 2>/dev/null || true
+  if [ -f "$TIMEOUT_FILE" ]; then
+    RUN_TIMED_OUT=1
+    rm -f "$TIMEOUT_FILE" 2>/dev/null || true
+  fi
   RUN_PID=
   TIMER_PID=
+  TIMEOUT_FILE=
+  [ "$RUN_TIMED_OUT" -eq 1 ] && return 0
   return "$rc"
 }
 
@@ -288,32 +404,118 @@ download_with_limit() {
   seconds=$3
 
   if command -v curl >/dev/null 2>&1; then
-    run_with_timeout "$seconds" curl -fsSL --connect-timeout 10 --max-time "$seconds" --limit-rate "$rate" -o /dev/null "$url"
-    return $?
-  fi
-  if command -v wget >/dev/null 2>&1; then
-    run_with_timeout "$seconds" wget -q --timeout=10 --tries=1 --limit-rate="$rate" -O /dev/null "$url"
-    return $?
-  fi
-  if command -v fetch >/dev/null 2>&1; then
+    downloader=curl
+  elif command -v wget >/dev/null 2>&1; then
+    downloader=wget
+  elif command -v fetch >/dev/null 2>&1; then
+    downloader=fetch
     log "fetch不支持可靠限速，将仅按时长下载 / fetch has no reliable rate limit, using duration limit only"
-    run_with_timeout "$seconds" fetch -q -o /dev/null -T 10 "$url"
-    return $?
+  else
+    log "未找到curl/wget/fetch，无法执行带宽占用 / curl/wget/fetch not found, cannot run bandwidth occupier"
+    return 1
   fi
 
-  log "未找到curl/wget/fetch，无法执行带宽占用 / curl/wget/fetch not found, cannot run bandwidth occupier"
-  return 1
+  start=$(epoch_seconds 2>/dev/null || echo 0)
+  if is_uint "$start" && [ "$start" -gt 0 ]; then
+    deadline=$((start + seconds))
+  else
+    deadline=0
+  fi
+
+  while :; do
+    if [ "$deadline" -gt 0 ]; then
+      current=$(epoch_seconds 2>/dev/null || echo 0)
+      if ! is_uint "$current" || [ "$current" -ge "$deadline" ]; then
+        return 0
+      fi
+      remaining=$((deadline - current))
+      [ "$remaining" -ge 1 ] || return 0
+    else
+      remaining=$seconds
+    fi
+
+    case "$downloader" in
+      curl)
+        run_with_timeout "$remaining" curl -fsSL --connect-timeout 10 \
+          --limit-rate "$rate" -o /dev/null "$url" 2>/dev/null
+        ;;
+      wget)
+        run_with_timeout "$remaining" wget -q --timeout=10 --tries=1 \
+          --limit-rate="$rate" -O /dev/null "$url"
+        ;;
+      fetch)
+        run_with_timeout "$remaining" fetch -q -o /dev/null -T 10 "$url"
+        ;;
+    esac
+    rc=$?
+    [ "$RUN_TIMED_OUT" -eq 1 ] && return 0
+    [ "$rc" -eq 0 ] || return "$rc"
+
+    # A finite test file can finish before the requested duration. Restart it
+    # while time remains so a 100 MB file does not shorten a six-minute run.
+    [ "$deadline" -gt 0 ] || return 0
+    sleep 1
+  done
 }
 
 run_wget_mode() {
+  count=$(url_count)
+  is_uint "$count" || count=0
+  [ "$count" -gt 0 ] || {
+    log "没有配置带宽下载源，跳过本轮 / No bandwidth download source is configured, skipping this run"
+    return 0
+  }
+
+  BANDWIDTH_SKIP_URLS=
+  url=$(select_url 2>/dev/null || true)
+  if [ -z "$url" ]; then
+    log "没有可用带宽下载源，跳过本轮并等待下次调度 / No usable bandwidth download source, skipping this run until the next schedule"
+    return 0
+  fi
+
   mbps=$(measure_bandwidth_mbps)
   rate=$(rate_bytes_per_second "$mbps")
   seconds=$((BANDWIDTH_DURATION_MINUTES * 60))
-  url=$(select_url)
+  run_start=$(epoch_seconds 2>/dev/null || echo 0)
+  if is_uint "$run_start" && [ "$run_start" -gt 0 ]; then
+    run_deadline=$((run_start + seconds))
+  else
+    run_deadline=0
+  fi
+  attempt=1
+  while [ "$attempt" -le "$count" ]; do
+    if [ "$run_deadline" -gt 0 ]; then
+      run_now=$(epoch_seconds 2>/dev/null || echo 0)
+      if ! is_uint "$run_now" || [ "$run_now" -ge "$run_deadline" ]; then
+        break
+      fi
+      attempt_seconds=$((run_deadline - run_now))
+      [ "$attempt_seconds" -ge 1 ] || break
+    else
+      attempt_seconds=$seconds
+    fi
 
-  log "开始带宽占用：${BANDWIDTH_DURATION_MINUTES}分钟，测速=${mbps}Mbps，限速=${rate}B/s，URL=$url / Starting bandwidth occupier: ${BANDWIDTH_DURATION_MINUTES} minutes, measured=${mbps}Mbps, limit=${rate}B/s"
-  download_with_limit "$url" "$rate" "$seconds" || log "带宽占用下载提前结束或失败 / Bandwidth download ended early or failed"
-  log "带宽占用结束 / Bandwidth occupier finished"
+    log "开始带宽占用：${BANDWIDTH_DURATION_MINUTES}分钟，测速=${mbps}Mbps，限速=${rate}B/s，URL=$url / Starting bandwidth occupier: ${BANDWIDTH_DURATION_MINUTES} minutes, measured=${mbps}Mbps, limit=${rate}B/s"
+    if download_with_limit "$url" "$rate" "$attempt_seconds"; then
+      log "带宽占用结束 / Bandwidth occupier finished"
+      return 0
+    fi
+
+    skip_url "$url"
+    log "下载源失败，将尝试下一个 / Download source failed, trying the next source: $url"
+    attempt=$((attempt + 1))
+    if [ "$run_deadline" -gt 0 ]; then
+      run_now=$(epoch_seconds 2>/dev/null || echo 0)
+      if ! is_uint "$run_now" || [ "$run_now" -ge "$run_deadline" ]; then
+        break
+      fi
+    fi
+    url=$(select_url 2>/dev/null || true)
+    [ -n "$url" ] || break
+  done
+
+  log "没有可用带宽下载源，跳过本轮并等待下次调度 / No usable bandwidth download source, skipping this run until the next schedule"
+  return 0
 }
 
 run_speedtest_mode() {
@@ -336,31 +538,31 @@ run_speedtest_mode() {
   log "speedtest带宽占用结束 / Speedtest bandwidth occupier finished"
 }
 
-case ${1:-} in
-  --help|-h)
-    printf '%s\n' "Usage: sh bandwidth_occupier.sh"
-    printf '%s\n' "配置 / Config: BANDWIDTH_MODE, BANDWIDTH_DURATION_MINUTES, BANDWIDTH_RATE_PERCENT, BANDWIDTH_RATE_MBPS, BANDWIDTH_SPEEDTEST_COUNT"
-    exit 0
-    ;;
-  --check)
-    normalize_settings
-    if command -v curl >/dev/null 2>&1 || command -v wget >/dev/null 2>&1 || command -v fetch >/dev/null 2>&1; then
-      printf '%s\n' "Bandwidth script OK / 带宽脚本检查通过"
+if [ "${OALIVE_LIBRARY_MODE:-0}" != 1 ]; then
+  case ${1:-} in
+    --help|-h)
+      printf '%s\n' "Usage: sh bandwidth_occupier.sh"
+      printf '%s\n' "配置 / Config: BANDWIDTH_MODE, BANDWIDTH_DURATION_MINUTES, BANDWIDTH_RATE_PERCENT, BANDWIDTH_RATE_MBPS, BANDWIDTH_SPEEDTEST_COUNT, BANDWIDTH_URL, BANDWIDTH_URLS, BANDWIDTH_URL_FILE, BANDWIDTH_URL_CHECKS"
       exit 0
-    fi
-    printf '%s\n' "No downloader found / 未找到下载工具"
-    exit 1
-    ;;
-esac
+      ;;
+    --check)
+      normalize_settings
+      if command -v curl >/dev/null 2>&1 || command -v wget >/dev/null 2>&1 || command -v fetch >/dev/null 2>&1; then
+        printf '%s\n' "Bandwidth script OK / 带宽脚本检查通过"
+        exit 0
+      fi
+      printf '%s\n' "No downloader found / 未找到下载工具"
+      exit 1
+      ;;
+  esac
 
-RUN_PID=
-TIMER_PID=
-normalize_settings
-acquire_lock
-trap terminate INT TERM
-trap cleanup EXIT
+  normalize_settings
+  acquire_lock
+  trap terminate INT TERM
+  trap cleanup EXIT
 
-case "$BANDWIDTH_MODE" in
-  speedtest) run_speedtest_mode ;;
-  *) run_wget_mode ;;
-esac
+  case "$BANDWIDTH_MODE" in
+    speedtest) run_speedtest_mode ;;
+    *) run_wget_mode ;;
+  esac
+fi

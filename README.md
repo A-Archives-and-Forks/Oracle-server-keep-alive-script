@@ -65,7 +65,7 @@ sh oalive.sh --update
 
 - CPU：默认使用 POSIX 兼容占用逻辑，按“单核配额百分比”工作；2 到 4 核机器默认 `核心数 * 20%`，其他机器默认 `25%`。在 systemd 环境会再写入 `CPUQuota` 做双重限制。
 - 内存：默认目标为总内存 `25%`，每轮占用 300 秒、休息 300 秒。会读取 Linux `/proc/meminfo` 或 BSD `sysctl` 指标，并按临时目录可用空间限幅。
-- 带宽：默认每 45 分钟触发一次，最长下载 6 分钟，速率按测速结果的 30%。自定义模式可直接指定 Mbps、时长、间隔。
+- 带宽：默认每 45 分钟触发一次，最长下载 6 分钟，速率按测速结果的 30%。下载源使用多个普通静态测试文件逐个探测；源全部不可用时跳过本轮并等待下次调度，不会反复请求失效的特殊下载地址。自定义模式可直接指定 Mbps、时长、间隔和下载源。
 - 调度：systemd 环境安装 `cpu-limit.service`、`memory-limit.service`、`bandwidth_occupier.timer`；cron 环境安装 `oalive-cron-runner.sh` 监督器。
 - 安全：所有任务都有原子目录锁，避免并发重入；卸载时按锁和精确脚本路径停止任务，不再靠模糊进程名匹配。
 - 日志：日志写入 `/var/log/oalive`，单文件默认 128 KiB 自动轮转到 `.1`。
@@ -90,6 +90,17 @@ sh oalive.sh --uninstall
 ## 自定义
 
 安装后可以编辑 `/etc/oalive/oalive.conf`，再重启对应调度：
+
+带宽下载源可以用单个 URL、逗号或空格分隔的 URL 列表，或一个“每行一个 URL”的文件覆盖默认候选。探测使用短 `GET` 请求，避免只支持 `GET` 的源被错误排除；`BANDWIDTH_URL_CHECKS=0` 表示检查全部候选。所有源都失败时本轮会记录并跳过。
+
+```sh
+BANDWIDTH_URL=""
+BANDWIDTH_URLS="https://example.com/large-file.bin,https://mirror.example.com/large-file.bin"
+BANDWIDTH_URL_FILE=""
+BANDWIDTH_URL_CHECKS=0
+BANDWIDTH_PROBE_TIMEOUT=5
+BANDWIDTH_PROBE_RATE=16384
+```
 
 systemd:
 
